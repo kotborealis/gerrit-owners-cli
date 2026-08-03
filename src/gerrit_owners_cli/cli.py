@@ -1,3 +1,20 @@
+"""Query Gerrit Code Owners from the command line or Python.
+
+CLI::
+
+    gerrit-owners path/to/file [--branch master] [--json]
+
+Public import API::
+
+    from gerrit_owners_cli import Account, OwnerResponse, lookup_owner_response
+
+    response: OwnerResponse = lookup_owner_response("path/to/file", branch="master")
+
+``OwnerResponse`` and ``Account`` describe the fields consumed by the public
+helpers. ``OwnersError`` is raised for configuration, credentials, or API
+errors.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -6,12 +23,36 @@ import configparser
 import json
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Protocol, TypedDict, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+__all__ = [
+    "Account",
+    "OwnersError",
+    "OwnerResponse",
+    "lookup_owner_response",
+]
+
+
+class Account(TypedDict, total=False):
+    _account_id: int | str
+    name: str
+    display_name: str
+    email: str
+
+
+class OwnerResponse(TypedDict, total=False):
+    code_owners: list[dict[str, Any]]
+    code_owner_configs: list[dict[str, Any]]
+
+
+class _Opener(Protocol):
+    def __call__(self, request: Request, *, timeout: float) -> AbstractContextManager[BinaryIO]: ...
 
 
 class OwnersError(RuntimeError):
@@ -132,7 +173,7 @@ def _parse_response(raw: str) -> dict[str, Any]:
     return response
 
 
-def extract_owner_groups(response: dict[str, Any]) -> list[str]:
+def extract_owner_groups(response: OwnerResponse) -> list[str]:
     groups: list[str] = []
     seen: set[str] = set()
 
@@ -180,9 +221,9 @@ def fetch_owner_response(
     url: str,
     username: str,
     password: str,
-    opener: Callable[..., Any] = urlopen,
-) -> dict[str, Any]:
-    return _fetch_json(url, username, password, opener)
+    opener: _Opener = urlopen,
+) -> OwnerResponse:
+    return cast(OwnerResponse, _fetch_json(url, username, password, opener))
 
 
 def fetch_account_response(
@@ -190,9 +231,12 @@ def fetch_account_response(
     account_id: int,
     username: str,
     password: str,
-    opener: Callable[..., Any] = urlopen,
-) -> dict[str, Any]:
-    return _fetch_json(build_account_url(host, account_id), username, password, opener)
+    opener: _Opener = urlopen,
+) -> Account:
+    return cast(
+        Account,
+        _fetch_json(build_account_url(host, account_id), username, password, opener),
+    )
 
 
 def _owner_request_details(file_path: str, branch: str) -> tuple[str, str, str, str]:
@@ -206,16 +250,17 @@ def _owner_request_details(file_path: str, branch: str) -> tuple[str, str, str, 
     return host, url, username, password
 
 
-def lookup_owner_response(file_path: str, branch: str) -> dict[str, Any]:
+def lookup_owner_response(file_path: str, branch: str = "master") -> OwnerResponse:
     _, url, username, password = _owner_request_details(file_path, branch)
     return fetch_owner_response(url, username, password)
 
 
-def extract_account_ids(response: dict[str, Any]) -> list[int]:
+def extract_account_ids(response: OwnerResponse) -> list[int]:
     account_ids: list[int] = []
     seen: set[int] = set()
     for owner in response.get("code_owners", []):
-        account_id = owner.get("account", {}).get("_account_id")
+        account = owner.get("account")
+        account_id = account.get("_account_id") if account else None
         if isinstance(account_id, int) and account_id not in seen:
             seen.add(account_id)
             account_ids.append(account_id)
@@ -223,12 +268,12 @@ def extract_account_ids(response: dict[str, Any]) -> list[int]:
 
 
 def resolve_accounts(
-    response: dict[str, Any],
+    response: OwnerResponse,
     host: str,
     username: str,
     password: str,
-    opener: Callable[..., Any] = urlopen,
-) -> list[dict[str, Any]]:
+    opener: _Opener = urlopen,
+) -> list[Account]:
     accounts = []
     for account_id in extract_account_ids(response):
         try:
@@ -239,13 +284,14 @@ def resolve_accounts(
     return accounts
 
 
-def format_owner_summary(response: dict[str, Any], accounts: list[dict[str, Any]]) -> str:
+def format_owner_summary(response: OwnerResponse, accounts: Sequence[Account]) -> str:
     lines = ["Owner groups:"]
     groups = extract_owner_groups(response)
     lines.extend(f"- {group}" for group in groups or ["none"])
     lines.append("")
     lines.append("Code owners:")
-    for account in accounts or [{"_account_id": "none"}]:
+    accounts_to_format: Sequence[Account] = accounts or [{"_account_id": "none"}]
+    for account in accounts_to_format:
         account_id = account.get("_account_id")
         name = account.get("name") or account.get("display_name")
         email = account.get("email")
